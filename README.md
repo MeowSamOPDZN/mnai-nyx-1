@@ -2,6 +2,8 @@
 
 **AIMYTOG: AI Model You'll Train On GPU.**
 
+**MNAI Nyx family is a real legit AI, That YOU have to train.**
+
 A 500B parameter frontier language model, from scratch. You bring the GPU. The repo is the model, the training code, and the tokenizer. Nothing is pre-trained here. You train it yourself, on your own cluster, with your own data. That is the whole point.
 
 The data is ALL of the internet. The full FineWeb crawl, 15 trillion tokens of open web text, plus FineWeb-Edu. That is the largest open web corpus there is.
@@ -129,6 +131,9 @@ python model.py
 MIT. Train it, use it, sell it. It is yours once you train it.
 
 ## FAQ
+
+**Is MNAI Nyx a real AI?**
+MNAI Nyx family is a real legit AI, That YOU have to train. The code is real, the architecture is real, and once you train it on your own GPU cluster, the model is real.
 
 **What is MNAI Nyx 1?**
 MNAI Nyx 1 is a 500B parameter frontier large language model, built from scratch by MeowSamOPDZN Studio. It is the first model in the Nyx family.
