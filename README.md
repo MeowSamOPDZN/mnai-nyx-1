@@ -93,6 +93,26 @@ python model.py
 
 MIT. Train it, use it, sell it. It is yours once you train it.
 
+## FAQ
+
+**What is MNAI Nyx 1?**
+MNAI Nyx 1 is a 500B parameter frontier large language model, built from scratch by MeowSamOPDZN Studio. It is the first model in the Nyx family.
+
+**What is AIMYTOG?**
+AIMYTOG stands for AI Model You'll Train On GPU. It is a new technology from MeowSamOPDZN Studio: instead of downloading a pre-trained model, you train the model yourself on your own GPU cluster. The repo gives you the model, the training code, and the tokenizer. You bring the GPU.
+
+**Can I train MNAI Nyx 1 myself?**
+Yes. That is the whole point. The repo is public. You need a GPU cluster (128x H100 minimum, 256x recommended), the training code uses FSDP to shard the 500B model across all your GPUs.
+
+**What data does MNAI Nyx 1 train on?**
+All of the internet. The full FineWeb crawl, 15 trillion tokens of open web text, plus FineWeb-Edu. A 500B model wants about 10T tokens, so the full internet is the right scale.
+
+**Is MNAI Nyx 1 open source?**
+Yes. The code is MIT licensed and public on GitHub. The model is yours once you train it.
+
+**How big is MNAI Nyx 1?**
+496.4 billion parameters. 20480 hidden, 112 layers, 160 attention heads, 152064 token vocabulary, 8192 context.
+
 ## Credits
 
 Built by MeowSamOPDZN Studio. The 500B shape is ours, the Llama block layout is standard so tooling just works.
