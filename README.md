@@ -69,6 +69,37 @@ torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
 python generate.py --model out-aimytog/ckpt-1000 --prompt "The future of AI is"
 ```
 
+## Training options
+
+```bash
+# WSD schedule with WandB logging and validation perplexity
+torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-aimytog \
+  --scheduler wsd --decay-frac 0.1 --wandb --wandb-project nyx1 \
+  --eval-every 1000 --eval-batches 20
+
+# Adafactor optimizer, fp16, custom data mix
+torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-aimytog \
+  --optim adafactor --dtype fp16 --data-mix "fineweb:0.7,fineweb-edu:0.3"
+```
+
+Schedulers: `cosine` (classic), `linear`, `wsd` (warmup-stable-decay,
+holds steady then decays at the end, good when you might stop early).
+Optimizers: `bnb8bit` (default), `adamw`, `adafactor`, `sgd`.
+
+## Evaluate a checkpoint
+
+```bash
+# perplexity, HellaSwag, ARC, Winogrande, and sample generations
+python evaluate.py --model out-aimytog/ckpt-1000 --limit 200
+
+# perplexity on your own text file
+python evaluate.py --model out-aimytog/ckpt-1000 --val-file ./val.txt
+```
+
 ## Smoke test
 
 No GPU, no data download. Uses a tiny twin of the same block layout.
@@ -82,10 +113,14 @@ python model.py
 
 | File | What it is |
 |---|---|
-| `model.py` | The 500B architecture (MNAI Nyx 1), param count on meta device |
-| `train.py` | FSDP2 distributed training, 8-bit Adam, checkpointing, full internet data |
+| `model.py` | The 500B architecture (MNAI Nyx 1), param count, FLOPs, init, surgery helpers |
+| `train.py` | FSDP2 distributed training, schedulers, optimizers, WandB, eval, full checkpoints |
+| `data.py` | Data loading, filtering, dedup, tokenization, dataset mixing |
+| `evaluate.py` | Perplexity, HellaSwag / ARC / Winogrande benchmarks, generation quality |
+| `utils.py` | Logging, seeding, distributed helpers, checkpoints, memory profiling |
+| `inference.py` | Generation with KV cache, batched generation, sampling, chat |
 | `train_tokenizer.py` | Byte-level BPE tokenizer, 152064 tokens |
-| `generate.py` | Text generation from a checkpoint |
+| `generate.py` | Text generation from a checkpoint, CLI wrapper around inference.py |
 | `config.json` | Model config, HF format |
 | `requirements.txt` | Dependencies |
 
