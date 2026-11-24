@@ -19,21 +19,46 @@ On 256x H100 80GB, that is about 12GB per GPU for states, leaving
 room for activations. On 512x H100, about 6GB. Do not try this on
 fewer than 128 GPUs unless you know what you are doing.
 
-Data is ALL of the internet, streamed from Hugging Face. The full
-FineWeb crawl (15T tokens of open web text) plus FineWeb-Edu, tokenized
-on the fly with the Nyx 1 tokenizer, packed into 8192-token blocks.
-Checkpoints save in HF format every so often, so a job ending just
-means resume with --resume and keep going.
-
 Chinchilla-optimal for 500B params is about 10T tokens. That is the
 default --max-tokens. At 256x H100, expect roughly 6-12 months of
 training. This is a frontier run, not a weekend project.
+
+What this script does beyond the basic loop
+-------------------------------------------
+Schedulers: cosine, linear, and WSD (warmup-stable-decay). Cosine
+is the classic, WSD is the modern pick because you can stop the run
+early and decay from wherever you are, which is handy on a run that
+might get cut short.
+
+Optimizers: AdamW, 8-bit Adam (default, saves memory), Adafactor,
+and SGD with momentum. 8-bit Adam is the default because at 500B
+the optimizer states are the difference between fitting and not.
+
+Checkpoints: weights in HF format, plus optimizer state, scheduler
+state, and RNG state, so a resume is a true resume. The LR schedule
+and the optimizer moments pick up exactly where they left off,
+instead of restarting warmup from scratch.
+
+Eval: validation perplexity every so often, on a fixed held-out
+slice of the same data mix. Watch it go down. If it goes up, stop
+the run and figure out why before burning more GPU hours.
+
+Logging: console, a JSONL log file, and optional Weights and
+Biases. Throughput is logged as tokens per second and MFU, the
+model FLOPs utilization, so you can tell if the cluster is actually
+working or just burning power.
 
 Usage, torchrun on a cluster:
   torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
     --master_addr=<master> --master_port=29500 \
     train.py --tokenizer ./tokenizer --out out-aimytog \
     --max-tokens 10000000000000 --micro-batch 1 --grad-accum 2048
+
+WSD schedule with WandB logging:
+  torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
+    --master_addr=<master> --master_port=29500 \
+    train.py --tokenizer ./tokenizer --out out-aimytog \
+    --scheduler wsd --decay-frac 0.1 --wandb --wandb-project nyx1
 
 Smoke test on CPU, no data download. Uses a tiny twin of the same
 block layout for the loop test, full 500B forward is in model.py:
@@ -49,9 +74,32 @@ import time
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from transformers import PreTrainedTokenizerFast, get_cosine_schedule_with_warmup
+from transformers import PreTrainedTokenizerFast
 
-from model import VOCAB_SIZE, build_config, build_model, count_params
+from data import batch_stream, build_mix, validation_batches
+from model import VOCAB_SIZE, build_config, build_model, count_params, estimate_flops_per_token
+from utils import (
+    MetricLogger,
+    Timer,
+    all_reduce_mean,
+    atomic_write_json,
+    format_bytes,
+    format_number,
+    format_time,
+    free_disk_gb,
+    grad_norm,
+    latest_checkpoint,
+    list_checkpoints,
+    load_trainer_state,
+    memory_report,
+    param_norm,
+    prune_checkpoints,
+    read_train_log,
+    save_trainer_state,
+    seed_all,
+    setup_logging,
+    write_train_log,
+)
 
 SEQ_LEN = 8192
 # smoke test uses a tiny sequence, a full 8192 block on CPU would crawl
@@ -59,22 +107,66 @@ SEQ_LEN = 8192
 
 def parse_args():
     p = argparse.ArgumentParser()
+    # data and output
     p.add_argument("--tokenizer", default="tokenizer")
     p.add_argument("--out", default="out-aimytog")
     p.add_argument("--resume", default=None)
+    p.add_argument("--data-mix", default=None,
+                   help="dataset mix like 'fineweb:0.8,fineweb-edu:0.2', default is 80/20")
+    p.add_argument("--no-filter", action="store_true",
+                   help="skip document filtering, train on raw docs")
+    p.add_argument("--dedup", action="store_true",
+                   help="turn on exact + near-dup filtering (slower, cleaner data)")
+    # training length
     p.add_argument("--max-tokens", type=int, default=10_000_000_000_000)
     p.add_argument("--max-steps", type=int, default=0, help="optimizer steps, 0 = use max-tokens")
     p.add_argument("--micro-batch", type=int, default=1)
     p.add_argument("--grad-accum", type=int, default=2048)
     p.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    # optimizer and schedule
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--warmup", type=int, default=2000)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
+    p.add_argument("--scheduler", default="cosine",
+                   choices=["cosine", "linear", "wsd"],
+                   help="cosine decays the whole run, linear is a straight line, "
+                        "wsd holds steady then decays at the end")
+    p.add_argument("--decay-frac", type=float, default=0.1,
+                   help="for wsd: share of steps spent decaying at the end")
     p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--optim", default="bnb8bit", choices=["bnb8bit", "adamw"])
+    p.add_argument("--optim", default="bnb8bit",
+                   choices=["bnb8bit", "adamw", "adafactor", "sgd"])
+    p.add_argument("--beta1", type=float, default=0.9)
+    p.add_argument("--beta2", type=float, default=0.95)
+    p.add_argument("--eps", type=float, default=1e-8)
+    p.add_argument("--momentum", type=float, default=0.9,
+                   help="momentum for sgd")
+    # clipping and precision
+    p.add_argument("--clip", type=float, default=1.0,
+                   help="grad clip value, 0 disables clipping")
+    p.add_argument("--clip-mode", default="norm", choices=["norm", "value"],
+                   help="norm clips the global grad norm, value clips each grad element")
+    p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"],
+                   help="training dtype, bf16 is the sane default")
+    p.add_argument("--no-grad-checkpoint", action="store_true",
+                   help="turn off gradient checkpointing (faster, much more memory)")
+    # logging and eval
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--ckpt-every", type=int, default=500)
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="run validation perplexity every N steps, 0 = off")
+    p.add_argument("--eval-batches", type=int, default=20,
+                   help="how many validation batches per eval")
+    p.add_argument("--keep-ckpts", type=int, default=3,
+                   help="how many checkpoints to keep on disk")
+    p.add_argument("--no-save-optim", action="store_true",
+                   help="skip saving optimizer state in checkpoints (smaller, resume restarts moments)")
+    p.add_argument("--wandb", action="store_true",
+                   help="log to Weights and Biases, needs wandb installed")
+    p.add_argument("--wandb-project", default="nyx1")
+    p.add_argument("--wandb-run", default=None)
+    p.add_argument("--log-file", default=None)
     p.add_argument("--max-hours", type=float, default=0,
                    help="stop cleanly after this many hours, saving a checkpoint first, 0 = off")
     p.add_argument("--smoke", action="store_true")
@@ -85,74 +177,277 @@ def is_main():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def token_stream(tok, smoke=False):
-    # endless stream of token ids, so training never waits on disk
-    if smoke:
-        rng = random.Random(0)
-        while True:
-            yield rng.randrange(100, VOCAB_SIZE)
-        return
-    from datasets import interleave_datasets, load_dataset
+# schedulers
+# ----------
 
-    if is_main():
-        print("loading the full internet stream (FineWeb 15T + FineWeb-Edu)...", flush=True)
-        print("first download can take a few minutes...", flush=True)
-    # the whole internet: full FineWeb crawl, 15T tokens, plus Edu
-    ds_web = load_dataset("HuggingFaceFW/fineweb", "default",
-                          split="train", streaming=True)
-    ds_edu = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT",
-                          split="train", streaming=True)
-    ds = interleave_datasets([ds_web, ds_edu], probabilities=[0.8, 0.2])
-    if is_main():
-        print("stream ready, reading first docs...", flush=True)
-    n_docs = 0
-    for row in ds:
-        text = row["text"]
-        n_docs += 1
-        if n_docs == 1 and is_main():
-            print(f"first doc loaded, {len(text):,} chars, tokenizing...", flush=True)
-        for tok_id in tok.encode(text):
-            yield tok_id
+def lr_multiplier(step, total_steps, warmup, min_ratio, scheduler, decay_frac=0.1):
+    """LR multiplier at a step, 0 to 1, for any of the three schedules.
 
-
-def batch_stream(tok, micro_batch, smoke=False, seq_len=SEQ_LEN):
-    # pack the token stream into seq_len blocks, then into batches
-    buf = []
-    stream = token_stream(tok, smoke=smoke)
-    first = True
-    while True:
-        while len(buf) < seq_len * micro_batch:
-            try:
-                buf.append(next(stream))
-            except StopIteration:
-                stream = token_stream(tok, smoke=smoke)
-        chunk = buf[: seq_len * micro_batch]
-        buf = buf[seq_len * micro_batch:]
-        x = torch.tensor(chunk, dtype=torch.long).view(micro_batch, seq_len)
-        if first and is_main():
-            print("first batch ready, starting training...", flush=True)
-            first = False
-        yield x
+    Warmup is linear from 0 to 1. After that the schedules differ.
+    Cosine decays smoothly to min_ratio over the whole run. Linear
+    decays in a straight line. WSD holds at 1.0 until the last
+    decay_frac of steps, then decays linearly to min_ratio. WSD is
+    nice because you can decide late when to stop and still get a
+    clean decay.
+    """
+    if total_steps <= 0:
+        return 1.0
+    if step < warmup:
+        return (step + 1) / max(1, warmup)
+    if scheduler == "cosine":
+        progress = (step - warmup) / max(1, total_steps - warmup)
+        progress = min(1.0, progress)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_ratio + (1 - min_ratio) * cosine
+    if scheduler == "linear":
+        progress = (step - warmup) / max(1, total_steps - warmup)
+        progress = min(1.0, progress)
+        return min_ratio + (1 - min_ratio) * (1 - progress)
+    if scheduler == "wsd":
+        decay_steps = max(1, int(total_steps * decay_frac))
+        decay_start = total_steps - decay_steps
+        if step < decay_start:
+            return 1.0
+        progress = (step - decay_start) / decay_steps
+        progress = min(1.0, progress)
+        return min_ratio + (1 - min_ratio) * (1 - progress)
+    raise ValueError(f"unknown scheduler {scheduler!r}")
 
 
-def save_ckpt(model, tok, out_dir, step, tokens_seen, extra=None):
-    # only rank 0 writes, FSDP gathers the full state dict first
+def build_scheduler(opt, args, total_steps):
+    """A LambdaLR that follows the chosen schedule."""
+    def fn(step):
+        return lr_multiplier(step, total_steps, args.warmup,
+                             args.min_lr_ratio, args.scheduler,
+                             decay_frac=args.decay_frac)
+    return torch.optim.lr_scheduler.LambdaLR(opt, fn)
+
+
+# optimizers
+# ----------
+
+def build_optimizer(model, args):
+    """Build the optimizer, with a bitsandbytes fallback to AdamW.
+
+    8-bit Adam is the default because it cuts optimizer memory by
+    4x, which matters a lot at 500B. Adafactor is the low-memory
+    backup if bitsandbytes is not there. SGD is there for the
+    curious, it works but needs more tuning.
+    """
+    params = model.parameters()
+    if args.optim == "bnb8bit":
+        try:
+            import bitsandbytes as bnb
+
+            return bnb.optim.AdamW8bit(
+                params, lr=args.lr, weight_decay=args.weight_decay,
+                betas=(args.beta1, args.beta2), eps=args.eps)
+        except Exception as e:
+            if is_main():
+                print(f"8-bit Adam not available ({e}), falling back to AdamW", flush=True)
+            return torch.optim.AdamW(
+                params, lr=args.lr, weight_decay=args.weight_decay,
+                betas=(args.beta1, args.beta2), eps=args.eps)
+    if args.optim == "adamw":
+        return torch.optim.AdamW(
+            params, lr=args.lr, weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2), eps=args.eps)
+    if args.optim == "adafactor":
+        try:
+            return torch.optim.Adafactor(
+                params, lr=args.lr, weight_decay=args.weight_decay,
+                beta2_decay=-0.8, eps=(None, args.eps),
+                clip_threshold=1.0, relative_step=False)
+        except Exception as e:
+            if is_main():
+                print(f"Adafactor failed ({e}), falling back to AdamW", flush=True)
+            return torch.optim.AdamW(
+                params, lr=args.lr, weight_decay=args.weight_decay,
+                betas=(args.beta1, args.beta2), eps=args.eps)
+    if args.optim == "sgd":
+        return torch.optim.SGD(
+            params, lr=args.lr, weight_decay=args.weight_decay,
+            momentum=args.momentum, nesterov=True)
+    raise ValueError(f"unknown optimizer {args.optim!r}")
+
+
+def optimizer_name(args):
+    return {"bnb8bit": "AdamW 8-bit", "adamw": "AdamW",
+            "adafactor": "Adafactor", "sgd": "SGD"}[args.optim]
+
+
+# checkpoints
+# -----------
+
+def save_ckpt(model, tok, out_dir, step, tokens_seen, opt=None, sched=None,
+              extra=None, save_optim=True):
+    """Save a checkpoint: weights, tokenizer, trainer state, and
+    optionally optimizer state, scheduler state and RNG state.
+
+    Only rank 0 writes. The weights go in HF format so anything
+    that reads a Llama checkpoint can read this one. The optimizer
+    and scheduler states go in separate files, so a checkpoint with
+    --no-save-optim is still a valid weights checkpoint. The trainer
+    state is written atomically, so a crash mid-save cannot corrupt
+    it and trick a resume into the wrong step.
+    """
     if not is_main():
         return
     os.makedirs(out_dir, exist_ok=True)
     model.save_pretrained(out_dir)
-    tok.save_pretrained(out_dir)
+    if tok is not None:
+        tok.save_pretrained(out_dir)
     state = {"step": step, "tokens_seen": tokens_seen}
     if extra:
         state.update(extra)
-    with open(os.path.join(out_dir, "trainer_state.json"), "w") as f:
-        json.dump(state, f, indent=2)
+    save_trainer_state(out_dir, state)
+    if save_optim and opt is not None:
+        try:
+            torch.save(opt.state_dict(), os.path.join(out_dir, "optim.pt"))
+        except Exception as e:
+            print(f"could not save optimizer state: {e}", flush=True)
+    if sched is not None:
+        try:
+            torch.save(sched.state_dict(), os.path.join(out_dir, "sched.pt"))
+        except Exception as e:
+            print(f"could not save scheduler state: {e}", flush=True)
+    try:
+        torch.save({"python": random.getstate(),
+                    "torch": torch.get_rng_state()},
+                   os.path.join(out_dir, "rng.pt"))
+    except Exception as e:
+        print(f"could not save RNG state: {e}", flush=True)
+
+
+def load_ckpt_state(ckpt_dir, opt=None, sched=None):
+    """Read the small state files from a checkpoint dir.
+
+    Returns (step, tokens_seen, loaded_optim, loaded_sched). Missing
+    files are fine, it just means the resume starts fresh on that
+    piece, and it prints a warning so you know. Weights are loaded
+    separately by the caller with from_pretrained.
+    """
+    state = load_trainer_state(ckpt_dir)
+    step = state.get("step", 0)
+    tokens_seen = state.get("tokens_seen", 0)
+    loaded_optim = False
+    loaded_sched = False
+    optim_path = os.path.join(ckpt_dir, "optim.pt")
+    if opt is not None and os.path.exists(optim_path):
+        try:
+            opt.load_state_dict(torch.load(optim_path, map_location="cpu",
+                                           weights_only=False))
+            loaded_optim = True
+        except Exception as e:
+            print(f"could not load optimizer state, starting fresh: {e}", flush=True)
+    sched_path = os.path.join(ckpt_dir, "sched.pt")
+    if sched is not None and os.path.exists(sched_path):
+        try:
+            sched.load_state_dict(torch.load(sched_path, map_location="cpu",
+                                             weights_only=False))
+            loaded_sched = True
+        except Exception as e:
+            print(f"could not load scheduler state, starting fresh: {e}", flush=True)
+    rng_path = os.path.join(ckpt_dir, "rng.pt")
+    if os.path.exists(rng_path):
+        try:
+            rng = torch.load(rng_path, map_location="cpu", weights_only=False)
+            random.setstate(rng["python"])
+            torch.set_rng_state(rng["torch"])
+        except Exception as e:
+            print(f"could not load RNG state: {e}", flush=True)
+    return step, tokens_seen, loaded_optim, loaded_sched
+
+
+def resolve_resume(args):
+    """Turn --resume into a checkpoint dir.
+
+    Accepts a direct ckpt-* dir, or an output dir, in which case the
+    latest checkpoint inside it is used. Returns None if nothing
+    was passed, raises if the path does not exist.
+    """
+    if not args.resume:
+        return None
+    path = args.resume
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"resume path not found: {path}")
+    if os.path.exists(os.path.join(path, "trainer_state.json")):
+        return path
+    latest = latest_checkpoint(path)
+    if latest is None:
+        raise FileNotFoundError(f"no checkpoints inside {path}")
+    if is_main():
+        print(f"resume path is an output dir, using latest: {latest}", flush=True)
+    return latest
+
+
+# validation
+# ----------
+
+@torch.no_grad()
+def run_validation(model, tok, args, device, eval_batches=None):
+    """Validation perplexity on a fixed held-out slice.
+
+    Uses the same data mix but a fixed seed, so the number is
+    comparable across runs. Returns a dict with loss and perplexity.
+    Runs in eval mode and puts the model back in train mode after.
+    """
+    from evaluate import eval_perplexity
+
+    n = eval_batches or args.eval_batches
+    blocks = validation_batches(tok, args.micro_batch, args.seq_len,
+                                n_docs=n * args.micro_batch)
+    if not blocks:
+        return {"loss": float("nan"), "perplexity": float("nan")}
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    for chunk in blocks[:n]:
+        x = torch.tensor([chunk], dtype=torch.long, device=device)
+        out = model(x, labels=x)
+        total_loss += float(out.loss.item()) * x.numel()
+        total_tokens += x.numel()
+    model.train()
+    loss = total_loss / max(1, total_tokens)
+    return {"loss": loss, "perplexity": math.exp(loss) if loss < 700 else float("inf")}
+
+
+# wandb
+# -----
+
+def setup_wandb(args, total_steps):
+    """Start a WandB run if asked, else return None.
+
+    WandB is optional. If it is not installed, this warns and
+    returns None, and training carries on with console and JSONL
+    logging only. Nothing here should ever kill a run.
+    """
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except Exception:
+        if is_main():
+            print("wandb not installed, skipping WandB logging", flush=True)
+        return None
+    run = wandb.init(project=args.wandb_project, name=args.wandb_run,
+                     config={**vars(args), "total_steps": total_steps})
+    return run
+
+
+def log_wandb(run, row):
+    if run is None:
+        return
+    try:
+        run.log(row)
+    except Exception:
+        pass
 
 
 def main():
     args = parse_args()
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    log = setup_logging(log_file=args.log_file)
+    seed_all(args.seed)
 
     # distributed setup, torchrun sets these env vars
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -166,7 +461,14 @@ def main():
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if is_main():
-        print(f"device: {device}, world size: {world_size}", flush=True)
+        log.info(f"device: {device}, world size: {world_size}")
+
+    # dtype for training: bf16 default, fp16 if you must, fp32 for tiny tests
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                 "fp32": torch.float32}
+    train_dtype = dtype_map[args.dtype]
+    if device == "cpu":
+        train_dtype = torch.float32
 
     if args.smoke:
         # smoke mode uses random tokens, no dataset, no tokenizer file
@@ -176,35 +478,31 @@ def main():
         args.micro_batch = 1
         args.grad_accum = 1
         args.optim = "adamw"
+        args.eval_every = 0
         if is_main():
-            print("smoke mode: random tokens, no dataset, no tokenizer file", flush=True)
+            log.info("smoke mode: random tokens, no dataset, no tokenizer file")
     else:
         tok = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer)
         tok.pad_token = "<pad>"
         tok.bos_token = "<bos>"
         tok.eos_token = "<eos>"
         assert tok.vocab_size == VOCAB_SIZE, f"tokenizer vocab {tok.vocab_size} != {VOCAB_SIZE}"
+        mix = build_mix(args.data_mix)
+        if is_main():
+            log.info("data mix: " + ", ".join(f"{m['name']}:{m['weight']}" for m in mix))
 
     # smoke uses a tiny twin of the same shape (2 layers, 256 hidden)
     # for the loop test, because a full 500B backward pass needs a cluster.
     # The full 500B param count is tested with python model.py.
-    train_dtype = torch.float32 if device == "cpu" else torch.bfloat16
-    if args.resume:
+    resume_dir = resolve_resume(args)
+    if resume_dir:
         if is_main():
-            print(f"resuming weights from {args.resume}", flush=True)
+            log.info(f"resuming weights from {resume_dir}")
         from transformers import LlamaForCausalLM
 
-        model = LlamaForCausalLM.from_pretrained(args.resume, torch_dtype=train_dtype)
+        model = LlamaForCausalLM.from_pretrained(resume_dir, torch_dtype=train_dtype)
         step = 0
         tokens_seen = 0
-        resume_state = os.path.join(args.resume, "trainer_state.json")
-        if os.path.exists(resume_state):
-            with open(resume_state) as f:
-                saved = json.load(f)
-            step = saved.get("step", 0)
-            tokens_seen = saved.get("tokens_seen", 0)
-        if is_main():
-            print(f"resumed at step {step}, tokens {tokens_seen:,}", flush=True)
     else:
         if args.smoke:
             from transformers import LlamaConfig, LlamaForCausalLM
@@ -217,7 +515,7 @@ def main():
             tiny_cfg.num_key_value_heads = 2
             model = LlamaForCausalLM(tiny_cfg)
             if is_main():
-                print("smoke model: tiny twin, same block layout, 2 layers", flush=True)
+                log.info("smoke model: tiny twin, same block layout, 2 layers")
         else:
             model = build_model(dtype=train_dtype)
         step = 0
@@ -225,7 +523,7 @@ def main():
 
     total, _ = count_params(model)
     if is_main():
-        print(f"model: {total:,} params ({total / 1e9:.1f}B)", flush=True)
+        log.info(f"model: {total:,} params ({total / 1e9:.3f}B)")
     model.to(device)
 
     # FSDP2: shard the 500B model across all GPUs
@@ -236,116 +534,172 @@ def main():
             fully_shard(layer)
         fully_shard(model)
         if is_main():
-            print(f"FSDP2 enabled, sharded across {world_size} GPUs", flush=True)
+            log.info(f"FSDP2 enabled, sharded across {world_size} GPUs")
 
-    model.gradient_checkpointing_enable()
+    if not args.no_grad_checkpoint:
+        model.gradient_checkpointing_enable()
     model.train()
 
-    if args.smoke:
-        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
-        if is_main():
-            print("optimizer: AdamW (smoke, tiny model)", flush=True)
-    elif args.optim == "bnb8bit":
-        try:
-            import bitsandbytes as bnb
-
-            opt = bnb.optim.AdamW8bit(model.parameters(), lr=args.lr,
-                                      weight_decay=args.weight_decay, betas=(0.9, 0.95))
-            if is_main():
-                print("optimizer: AdamW 8-bit", flush=True)
-        except Exception as e:
-            if is_main():
-                print(f"8-bit Adam not available ({e}), falling back to AdamW", flush=True)
-            opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                    weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    else:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                weight_decay=args.weight_decay, betas=(0.9, 0.95))
-        if is_main():
-            print("optimizer: AdamW", flush=True)
+    opt = build_optimizer(model, args)
+    if is_main():
+        log.info(f"optimizer: {optimizer_name(args)}")
 
     tokens_per_step = args.micro_batch * args.seq_len * args.grad_accum * world_size
     if args.max_steps:
         total_steps = args.max_steps
     else:
         total_steps = max(1, args.max_tokens // tokens_per_step)
-    sched = get_cosine_schedule_with_warmup(
-        opt, args.warmup, total_steps)
+    sched = build_scheduler(opt, args, total_steps)
     if is_main():
-        print(f"plan: {total_steps} optimizer steps, {tokens_per_step:,} tokens/step", flush=True)
-        print(f"target tokens: {args.max_tokens:,}", flush=True)
+        log.info(f"plan: {total_steps} optimizer steps, {tokens_per_step:,} tokens/step")
+        log.info(f"target tokens: {args.max_tokens:,}")
+        log.info(f"scheduler: {args.scheduler}, warmup {args.warmup}, "
+                 f"min lr ratio {args.min_lr_ratio}")
 
-    stream = batch_stream(tok, args.micro_batch, smoke=args.smoke, seq_len=args.seq_len)
-    use_bf16 = device != "cpu"
+    # resume the small state after the optimizer and scheduler exist
+    if resume_dir:
+        step, tokens_seen, got_opt, got_sched = load_ckpt_state(
+            resume_dir, opt=opt, sched=sched)
+        if is_main():
+            log.info(f"resumed at step {step}, tokens {tokens_seen:,}, "
+                     f"optimizer state: {got_opt}, scheduler state: {got_sched}")
+
+    run = setup_wandb(args, total_steps)
+    metrics = MetricLogger(window=100)
+    timer = Timer()
+    flops_per_token = estimate_flops_per_token(seq_len=args.seq_len)
+
+    stream = batch_stream(tok, args.micro_batch, seq_len=args.seq_len,
+                          mix=args.data_mix, seed=args.seed,
+                          filter_docs=not args.no_filter,
+                          dedup=None, smoke=args.smoke)
+    # dedup filter is built here so its state survives across batches
+    if args.dedup and not args.smoke:
+        from data import DedupFilter
+
+        dedup_filter = DedupFilter()
+        stream = batch_stream(tok, args.micro_batch, seq_len=args.seq_len,
+                              mix=args.data_mix, seed=args.seed,
+                              filter_docs=not args.no_filter,
+                              dedup=dedup_filter, smoke=False)
+    use_bf16 = device != "cpu" and args.dtype in ("bf16", "fp16")
+    autocast_dtype = dtype_map[args.dtype] if use_bf16 else torch.bfloat16
     t0 = time.time()
     micro = 0
     loss_sum = 0.0
     loss_n = 0
+    stop_reason = "finished"
 
     if is_main():
-        print("waiting for first batch, this can take a few minutes on first run...", flush=True)
+        log.info("waiting for first batch, this can take a few minutes on first run...")
+        free = free_disk_gb(args.out) if os.path.isdir(args.out) else free_disk_gb(".")
+        log.info(f"free disk: {free:.0f} GB")
+
     while step < total_steps:
-        x = next(stream).to(device)
+        timer.start("batch")
+        try:
+            x = next(stream).to(device)
+        except StopIteration:
+            stream = batch_stream(tok, args.micro_batch, seq_len=args.seq_len,
+                                  mix=args.data_mix, seed=args.seed,
+                                  filter_docs=not args.no_filter,
+                                  dedup=None, smoke=args.smoke)
+            x = next(stream).to(device)
+        timer.stop("batch")
         if micro == 0 and step == 0 and is_main():
-            print("first batch in, running first forward/backward...", flush=True)
+            log.info("first batch in, running first forward/backward...")
+        timer.start("forward")
         with torch.autocast(device_type="cuda" if device != "cpu" else "cpu",
-                            dtype=torch.bfloat16, enabled=use_bf16):
+                            dtype=autocast_dtype, enabled=use_bf16):
             out = model(x, labels=x)
             loss = out.loss / args.grad_accum
+        timer.stop("forward")
+        timer.start("backward")
         loss.backward()
+        timer.stop("backward")
         loss_sum += out.loss.item()
         loss_n += 1
         micro += 1
         tokens_seen += x.numel() * world_size
 
         if micro % args.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # clip before the step, so one bad batch cannot blow up the run
+            if args.clip > 0:
+                if args.clip_mode == "norm":
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+                else:
+                    torch.nn.utils.clip_grad_value_(model.parameters(), args.clip)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
             step += 1
+            metrics.update(loss=loss_sum / max(loss_n, 1))
             if is_main() and (step <= 20 or step % args.log_every == 0):
                 el = time.time() - t0
                 tok_s = tokens_seen / max(el, 1)
-                print(f"step {step}/{total_steps} loss {loss_sum / max(loss_n, 1):.4f} "
-                      f"lr {sched.get_last_lr()[0]:.2e} tokens {tokens_seen:,} "
-                      f"{tok_s:,.0f} tok/s elapsed {el / 60:.1f}m", flush=True)
+                # MFU: what share of the GPU peak we actually use
+                mfu = flops_per_token * tok_s / (700e12 * world_size) if world_size else 0
+                gnorm = grad_norm(model)
+                mem = memory_report()
+                msg = (f"step {step}/{total_steps} loss {metrics.avg('loss'):.4f} "
+                       f"lr {sched.get_last_lr()[0]:.2e} tokens {format_number(tokens_seen)} "
+                       f"{tok_s:,.0f} tok/s mfu {mfu * 100:.1f}% "
+                       f"gnorm {gnorm:.2f} elapsed {format_time(el)}")
+                if mem["allocated"]:
+                    msg += f" mem {format_bytes(mem['allocated'])}"
+                log.info(msg)
+                row = {"step": step, "loss": metrics.avg("loss"),
+                       "lr": sched.get_last_lr()[0], "tokens_seen": tokens_seen,
+                       "tokens_per_sec": tok_s, "mfu": mfu,
+                       "grad_norm": gnorm, "time_s": el}
+                write_train_log(args.out, row)
+                log_wandb(run, row)
                 loss_sum, loss_n = 0.0, 0
+            # validation perplexity on a fixed held-out slice
+            if args.eval_every and step % args.eval_every == 0 and tok is not None:
+                val = run_validation(model, tok, args, device)
+                if is_main():
+                    log.info(f"eval step {step}: loss {val['loss']:.4f}, "
+                             f"perplexity {val['perplexity']:.2f}")
+                    write_train_log(args.out, {"step": step, "eval": val})
+                    log_wandb(run, {"step": step, **{f"eval/{k}": v for k, v in val.items()}})
             if step % args.ckpt_every == 0 or step == total_steps:
                 ckpt = os.path.join(args.out, f"ckpt-{step}")
                 if is_main():
-                    print(f"saving {ckpt}", flush=True)
-                if tok is not None:
-                    save_ckpt(model, tok, ckpt, step, tokens_seen)
-                else:
-                    if is_main():
-                        os.makedirs(ckpt, exist_ok=True)
-                        model.save_pretrained(ckpt)
+                    log.info(f"saving {ckpt}")
+                save_ckpt(model, tok, ckpt, step, tokens_seen, opt=opt,
+                          sched=sched, save_optim=not args.no_save_optim)
                 if is_main():
-                    with open(os.path.join(args.out, "train_log.jsonl"), "a") as f:
-                        f.write(json.dumps({"step": step, "tokens_seen": tokens_seen,
-                                            "time_s": time.time() - t0}) + "\n")
+                    removed = prune_checkpoints(args.out, keep=args.keep_ckpts)
+                    for r in removed:
+                        log.info(f"pruned old checkpoint {r}")
             if args.max_hours and (time.time() - t0) > args.max_hours * 3600:
                 ckpt = os.path.join(args.out, f"ckpt-{step}")
                 if not os.path.exists(os.path.join(ckpt, "trainer_state.json")):
                     if is_main():
-                        print(f"time limit reached, saving {ckpt}", flush=True)
-                    if tok is not None:
-                        save_ckpt(model, tok, ckpt, step, tokens_seen)
-                    else:
-                        if is_main():
-                            os.makedirs(ckpt, exist_ok=True)
-                            model.save_pretrained(ckpt)
+                        log.info(f"time limit reached, saving {ckpt}")
+                    save_ckpt(model, tok, ckpt, step, tokens_seen, opt=opt,
+                              sched=sched, save_optim=not args.no_save_optim)
                 if is_main():
-                    print(f"stopping at step {step}, time limit {args.max_hours}h reached", flush=True)
+                    log.info(f"stopping at step {step}, time limit {args.max_hours}h reached")
+                stop_reason = "time_limit"
                 break
             if args.smoke and step >= 3:
                 if is_main():
-                    print("smoke done, 3 steps ran fine", flush=True)
+                    log.info("smoke done, 3 steps ran fine")
+                stop_reason = "smoke"
                 break
 
+    el = time.time() - t0
     if is_main():
-        print(f"done. steps {step}, tokens {tokens_seen:,}, time {(time.time() - t0) / 60:.1f}m", flush=True)
+        log.info(f"done ({stop_reason}). steps {step}, tokens {format_number(tokens_seen)}, "
+                 f"time {format_time(el)}")
+        log.info("timing: " + timer.report().replace("\n", ", "))
+    if run is not None:
+        try:
+            run.finish()
+        except Exception:
+            pass
     if use_dist:
         dist.destroy_process_group()
 
